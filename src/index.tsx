@@ -6,21 +6,27 @@ import {
   showToast,
   Toast,
   LocalStorage,
-  Clipboard,
   useNavigation,
   confirmAlert,
   Alert,
+  closeMainWindow,
+  environment,
 } from "@raycast/api";
+import { execSync, execFileSync } from "child_process";
+import path from "path";
 import { useEffect, useState } from "react";
 
 interface Template {
   id: string;
   name: string;
-  html: string;
-  text: string;
+  // JSON string: { [pasteboardType: string]: base64EncodedData }
+  // Stores every format Notion puts on the clipboard — including its internal block format.
+  clipboardData: string;
+  preview: string;
 }
 
 const STORAGE_KEY = "templates";
+const BRIDGE = path.join(environment.assetsPath, "clipboard-bridge");
 
 async function loadTemplates(): Promise<Template[]> {
   const stored = await LocalStorage.getItem<string>(STORAGE_KEY);
@@ -31,24 +37,42 @@ async function saveTemplates(templates: Template[]): Promise<void> {
   await LocalStorage.setItem(STORAGE_KEY, JSON.stringify(templates));
 }
 
+function readAllClipboard(): { data: string; preview: string } | null {
+  try {
+    const data = execFileSync(BRIDGE, ["read"], { encoding: "utf8" }).trim();
+    const formats = JSON.parse(data) as Record<string, string>;
+    if (Object.keys(formats).length === 0) return null;
+
+    const textB64 =
+      formats["public.utf8-plain-text"] ??
+      formats["NSStringPboardType"] ??
+      formats["com.apple.traditional-mac-plain-text"];
+    const preview = textB64 ? Buffer.from(textB64, "base64").toString("utf8") : "";
+
+    return { data, preview };
+  } catch {
+    return null;
+  }
+}
+
+function writeAllClipboard(clipboardData: string): void {
+  execFileSync(BRIDGE, ["write"], { input: clipboardData, encoding: "utf8" });
+}
+
 // --- New Template Form ---
 
 function NewTemplateForm({ onSave }: { onSave: () => void }) {
   const { pop } = useNavigation();
   const [name, setName] = useState("");
-  const [captured, setCaptured] = useState<{ html: string; text: string } | null>(null);
+  const [captured, setCaptured] = useState<{ data: string; preview: string } | null>(null);
 
   async function captureClipboard() {
-    const content = await Clipboard.read();
-    if (!content.html) {
-      await showToast({
-        style: Toast.Style.Failure,
-        title: "No HTML content on clipboard",
-        message: "Copy a Notion block first, then try again.",
-      });
+    const result = readAllClipboard();
+    if (!result) {
+      await showToast({ style: Toast.Style.Failure, title: "Clipboard is empty" });
       return;
     }
-    setCaptured({ html: content.html, text: content.text ?? "" });
+    setCaptured(result);
     await showToast({ style: Toast.Style.Success, title: "Clipboard captured" });
   }
 
@@ -66,8 +90,8 @@ function NewTemplateForm({ onSave }: { onSave: () => void }) {
     const newTemplate: Template = {
       id: Date.now().toString(),
       name: name.trim(),
-      html: captured.html,
-      text: captured.text,
+      clipboardData: captured.data,
+      preview: captured.preview,
     };
     await saveTemplates([...templates, newTemplate]);
     await showToast({ style: Toast.Style.Success, title: `Saved "${newTemplate.name}"` });
@@ -88,10 +112,20 @@ function NewTemplateForm({ onSave }: { onSave: () => void }) {
         </ActionPanel>
       }
     >
-      <Form.TextField id="name" title="Name" placeholder="e.g. Meeting notes header" value={name} onChange={setName} />
+      <Form.TextField
+        id="name"
+        title="Name"
+        placeholder="e.g. Meeting notes header"
+        value={name}
+        onChange={setName}
+      />
       <Form.Description
         title="Clipboard"
-        text={captured ? `Ready — "${captured.text.slice(0, 60).trim()}${captured.text.length > 60 ? "…" : ""}"` : "Not captured yet. Copy a Notion block, then press ⌘V."}
+        text={
+          captured
+            ? `Ready — "${captured.preview.slice(0, 60).trim()}${captured.preview.length > 60 ? "…" : ""}"`
+            : "Not captured yet. Copy a Notion block, then press ⌘V."
+        }
       />
     </Form>
   );
@@ -115,8 +149,17 @@ export default function Command() {
   }, []);
 
   async function pasteTemplate(template: Template) {
-    await Clipboard.paste({ html: template.html, text: template.text });
-    await showToast({ style: Toast.Style.Success, title: `Pasted "${template.name}"` });
+    try {
+      // Restore the exact clipboard state Notion originally put there
+      writeAllClipboard(template.clipboardData);
+      // Close Raycast and let the previous app (Notion) regain focus
+      await closeMainWindow();
+      // Small delay for focus to transfer, then simulate CMD+V
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      execSync(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`);
+    } catch (e) {
+      await showToast({ style: Toast.Style.Failure, title: "Paste failed", message: String(e) });
+    }
   }
 
   async function deleteTemplate(template: Template) {
@@ -153,6 +196,7 @@ export default function Command() {
           <List.Item
             key={template.id}
             title={template.name}
+            subtitle={template.preview.slice(0, 60)}
             actions={
               <ActionPanel>
                 <Action title="Paste Template" onAction={() => pasteTemplate(template)} />
