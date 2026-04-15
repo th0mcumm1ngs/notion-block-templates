@@ -196,7 +196,7 @@ export default function Command() {
           <List.Item
             key={template.id}
             title={template.name}
-            subtitle={template.preview.slice(0, 60)}
+            subtitle={(template.preview ?? "").slice(0, 60)}
             actions={
               <ActionPanel>
                 <Action title="Paste Template" onAction={() => pasteTemplate(template)} />
